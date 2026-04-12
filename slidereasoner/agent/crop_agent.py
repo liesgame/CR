@@ -174,7 +174,7 @@ class BaseCropAgent(ReActAgentBase):
 
         # tools
         self.obersvaton_list = []
-        self.
+
 
     @property
     def sys_prompt(self) -> str:

@@ -1,17 +1,25 @@
 # -*- coding: utf-8 -*-
 """WSI zoom-in agent built on top of AgentScope.
 
-This module turns a whole-slide image (WSI) into an interactive visual
+This module turns a whole-slide image (WSI) into an interactive pathology
 reasoning session:
 
 1. Create an initial thumbnail observation from the WSI.
-2. Let the model reason over the current image observations.
-3. Allow the model to call ``zoom_in_image`` with a bbox and target mpp.
-4. Convert the crop result into a new observation and feed it back into
-   the conversation as a new user-visible image.
+2. Let the model reason over the current observation tree.
+3. Allow the model to zoom into a relative bbox on an existing observation.
+4. Save each zoom result as a new observation and feed it back to the model.
 
-The implementation borrows the overall reasoning/acting loop from the
-project notebook and packages it into a reusable Python module.
+Design choice used here:
+- The LLM only sees pathology-style magnification labels: 1x / 5x / 10x / 20x / 40x
+- Internally, crops are generated with canonical target mpp:
+    0.5x -> 20.0
+    2x -> 5.0
+    5x -> 2.0
+    10x -> 1.0
+    20x -> 0.5
+    40x -> 0.25
+- If the slide native resolution is lower than the requested canonical mpp,
+  controlled upsampling is allowed, but capped by `max_upsample_ratio`.
 """
 
 from __future__ import annotations
@@ -19,9 +27,13 @@ from __future__ import annotations
 import asyncio
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Annotated, Any, Dict, List, Literal, Optional, Sequence, Tuple, Type
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+
 
 import openslide
 import shortuuid
@@ -49,53 +61,135 @@ from slidereasoner.utils.logging_utils import logger
 from slidereasoner.utils.print_utils import print_multimodal_trace
 
 
+# -----------------------------
+# Fixed pathology magnifications
+# -----------------------------
+# 这里直接固定到你想要的 6 档。
+# LLM 层只操作这些倍率，底层统一用 canonical mpp 实现。
+MAG_LITERAL = Literal["0.5x", "2x", "5x", "10x", "20x", "40x"]
+
+MAG_TO_MPP: Dict[str, float] = {
+    "0.5x": 20.0,
+    "2x": 5.0,
+    "5x": 2.0,
+    "10x": 1.0,
+    "20x": 0.5,
+    "40x": 0.25,
+}
+
+MAG_ORDER: Tuple[str, ...] = ("0.5x", "2x", "5x", "10x", "20x", "40x")
+
+# Qwen3-VL 的尺寸建议按 32 的倍数对齐
+QWEN_SIZE_MULTIPLE = 32
+
+# 最多允许的数字上采样倍数。
+# 例如 20x-native -> 40x-display 是 2x，允许；
+# 如果还想更激进，可以再调大，但我建议先固定成 2.2。
+MAX_UPSAMPLE_FACTOR = 2.2
+
 DEFAULT_WSI_AGENT_PROMPT = """You are a pathology whole-slide image reasoning agent.
 
-You work on one WSI session at a time. The conversation may contain one or
-more observations, and each image is identified by an observation_index.
+You work on one WSI session at a time.
+Each image is identified by an observation_index.
 
-When solving the task:
-- Start from the currently available observations and inspect them carefully.
+Available magnifications are strictly:
+0.5x, 2x, 5x, 10x, 20x, 40x
+
+Observation ids are hierarchical path ids such as:
+- 0p5x_root
+- 0p5x_root-2x_1
+- 0p5x_root-2x_1-5x_1
+- 0p5x_root-2x_1-5x_1-10x_3
+
+Rules:
+- Start from the currently available observations.
+- The whole-slide overview starts at 0.5x and has observation_id = root.
 - If you need more detail, call `zoom_in_image`.
-- `bbox_2d` uses relative coordinates on a 0-1000 scale in the current
-  observation image: [x1, y1, x2, y2].
-- `target_mpp` is the target microns-per-pixel for the new crop. Smaller
-  mpp means higher magnification / more detail.
-- Reuse the returned observation_index in later tool calls.
-- Avoid repeatedly requesting the same region unless there is a clear reason.
-- If the crop tool reports the patch is too small or too large, adjust the
-  bbox and retry.
-
-When you have enough evidence, answer directly and clearly."""
+- `bbox_2d` uses relative coordinates on a 0-1000 scale:
+  [x1, y1, x2, y2]
+- Reuse returned observation_index values exactly as given in later tool calls.
+- Do not invent observation ids.
+- If needed, you may backtrack to an earlier observation and zoom a different region.
+- Avoid repeatedly requesting the same crop unless there is a clear reason.
+- Use 0.5x/2x for overview and region selection.
+- Use 5x/10x for structural confirmation.
+- Use 20x/40x for the highest-detail inspection available in this system.
+- When enough evidence is available, answer directly and clearly.
+"""
 
 
 @dataclass(slots=True)
 class ObservationMeta:
-    """Metadata for each rendered observation image."""
+    """Metadata for each rendered observation."""
 
-    observation_index: int
+    observation_id: str
     image_path: str
     label: str
-    level0_x: int
-    level0_y: int
-    level0_w: int
-    level0_h: int
+
+    # Native WSI coordinates of the rendered observation.
+    # native == OpenSlide level 0
+    native_x: int
+    native_y: int
+    native_w: int
+    native_h: int
+
+    # image dim 
+    image_w: int
+    image_h: int
+
+    # Effective display mpp of the returned observation image.
+    # 如果发生了有限上采样，这里仍然记录“显示尺度”的 mpp，
+    # 这样后续在该 observation 上再次框 bbox 时，几何映射仍然是自洽的。
     effective_mpp: float
-    parent_observation_index: Optional[int]
 
+    # Pathology-facing magnification label shown to the model.
+    display_mag: str
 
-def _infer_level0_mpp(
+    parent_observation_id: Optional[str]
+
+    # Tree bookkeeping
+    children_ids: List[str] = field(default_factory=list)
+    local_child_index: int = 0
+
+    # Extra bookkeeping for trace / explanation.
+    is_upsampled: bool = False
+    reason: str = ""
+    is_marked_roi: bool = False
+
+class ZoomInImageArgs(BaseModel):
+    """Arguments for zooming into a child region."""
+
+    observation_id: str = Field(..., description="Parent observation id.")
+    bbox_2d: List[int] = Field(
+        ...,
+        description="Relative bbox [x1, y1, x2, y2] on a 0-1000 scale.",
+        min_length=4,
+        max_length=4,
+    )
+    target_mag: MAG_LITERAL = Field(..., description="Target pathology magnification.")
+    label: str = Field(default="", description="Short label for this crop.")
+    reason: str = Field(default="", description="Why this crop is requested.")
+
+class BacktrackArgs(BaseModel):
+    """Arguments for backtracking to an existing observation."""
+
+    observation_id: str = Field(..., description="Observation to return to.")
+
+class MarkROIArgs(BaseModel):
+    """Arguments for marking an observation as a key ROI."""
+
+    observation_id: str = Field(..., description="Observation to mark.")
+    reason: str = Field(..., description="Why this observation is important.")
+
+def infer_native_mpp(
     slide: openslide.OpenSlide,
-    override_level0_mpp: Optional[float] = None,
+    override_native_mpp: Optional[float] = None,
 ) -> float:
-    """Infer level-0 mpp from OpenSlide properties."""
-
-    if override_level0_mpp is not None:
-        if override_level0_mpp <= 0:
-            raise ValueError(
-                f"override_level0_mpp must be positive, got {override_level0_mpp}",
-            )
-        return float(override_level0_mpp)
+    """Infer native mpp from OpenSlide properties."""
+    if override_native_mpp is not None:
+        if override_native_mpp <= 0:
+            raise ValueError(f"override_native_mpp must be positive, got {override_native_mpp}")
+        return float(override_native_mpp)
 
     properties = slide.properties
     candidates = (
@@ -114,184 +208,352 @@ def _infer_level0_mpp(
             continue
         if parsed > 0:
             if key == "hamamatsu.XResolution":
-                # Hamamatsu often stores pixels per mm; convert to um/px.
+                # Hamamatsu often stores pixels per mm.
                 return 1000.0 / parsed
             return parsed
 
     raise ValueError(
-        "Failed to infer level0 mpp from slide properties. "
-        "Please provide `level0_mpp` explicitly when starting the session.",
+        "Failed to infer native mpp from slide properties. "
+        "Please provide `override_native_mpp` explicitly when starting the session.",
     )
 
 
-def _validate_relative_bbox(bbox_2d: Sequence[float]) -> Tuple[float, float, float, float]:
-    """Validate a 0-1000 relative bbox."""
-
+def validate_relative_bbox_1000(bbox_2d: Sequence[int]) -> Tuple[int, int, int, int]:
+    """Validate a [x1, y1, x2, y2] bbox on a 0-1000 scale."""
     if len(bbox_2d) != 4:
         raise ValueError(f"bbox_2d must contain 4 values, got {bbox_2d}")
 
-    rel_x1, rel_y1, rel_x2, rel_y2 = [float(v) for v in bbox_2d]
-    values = (rel_x1, rel_y1, rel_x2, rel_y2)
+    x1, y1, x2, y2 = [int(v) for v in bbox_2d]
+    values = (x1, y1, x2, y2)
+
     if any(v < 0 or v > 1000 for v in values):
-        raise ValueError(
-            f"bbox_2d values must all be within [0, 1000], got {bbox_2d}",
-        )
-    if rel_x2 <= rel_x1 or rel_y2 <= rel_y1:
-        raise ValueError(
-            f"bbox_2d must satisfy x2>x1 and y2>y1, got {bbox_2d}",
-        )
-    return rel_x1, rel_y1, rel_x2, rel_y2
+        raise ValueError(f"bbox_2d values must all be within [0, 1000], got {bbox_2d}")
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError(f"bbox_2d must satisfy x2>x1 and y2>y1, got {bbox_2d}")
+
+    return x1, y1, x2, y2
 
 
-def _validate_patch_pixels_for_wsi(
-    bbox_2d: Sequence[float],
+
+def snap_to_multiple(value: int, multiple: int, mode: Literal["expand", "nearest"] = "expand") -> int:
+    """
+    将整数向下对齐到指定倍数。
+
+    这个函数主要用于“空间不足时”的兜底逻辑：
+    当期望输出尺寸对应的 native ROI 已经放不进 slide 内，
+    且又不想 padding，这时只能把输出尺寸缩小到“当前可行的最大倍数”。
+
+    Args:
+        value:
+            原始整数值。
+        multiple:
+            目标倍数，例如 32。
+
+    Returns:
+        不大于 value 的最大 multiple 倍数。
+    """
+    value = int(max(1, value))
+    if multiple <= 1:
+        return value
+
+    if mode == "expand":
+        return max(multiple, math.ceil(value / multiple) * multiple)
+
+    lower = int(max(multiple, math.floor(value / multiple) * multiple))
+    upper = int(max(multiple, math.ceil(value / multiple) * multiple))
+    return lower if abs(value - lower) <= abs(upper - value) else upper
+
+
+def snap_down_to_multiple(value: int, multiple: int) -> int:
+    """Snap a positive integer down to the nearest multiple."""
+    value = max(1, int(value))
+    if multiple <= 1:
+        return value
+    return int(max(multiple, math.floor(value / multiple) * multiple))
+
+
+def fit_pixels_to_budget(
     width: int,
     height: int,
-    observation_index: int,
-    source_mpp: float,
-    target_mpp: float,
-    factor: int = 32,
-) -> None:
-    """Validate image size constraints for model-side vision ingestion."""
+    multiple: int = QWEN_SIZE_MULTIPLE,
+    min_token_num: int = IMAGE_MIN_TOKEN_NUM,
+    max_token_num: int = IMAGE_MAX_TOKEN_NUM,
+) -> Tuple[int, int, float]:
+    """
+    Resize an image shape into the model pixel budget while preserving aspect ratio.
 
+    This is mainly used for the initial 0.5x overview, which may otherwise be too large.
+    """
+    width = max(1, int(width))
+    height = max(1, int(height))
+
+    min_pixels = min_token_num * multiple * multiple
+    max_pixels = max_token_num * multiple * multiple
+
+    pixels = width * height
+    if pixels > max_pixels:
+        scale = math.sqrt(max_pixels / pixels)
+    elif pixels < min_pixels:
+        scale = math.sqrt(min_pixels / pixels)
+    else:
+        scale = 1.0
+
+    out_w = snap_to_multiple(max(1, round(width * scale)), multiple, mode="nearest")
+    out_h = snap_to_multiple(max(1, round(height * scale)), multiple, mode="nearest")
+    return out_w, out_h, scale
+
+
+def place_interval_without_resizing(center: float, size: int, limit: int) -> int:
+    """
+    Place a fixed-size interval inside [0, limit) by shifting only.
+
+    This helper never changes `size`.
+    If `size` does not fit, the caller must reduce the requested output size first.
+    """
+    if size > limit:
+        raise ValueError(
+            f"Cannot place interval of size={size} inside limit={limit} without resizing."
+        )
+
+    start = int(round(center - size / 2.0))
+    start = max(0, min(start, limit - size))
+    return start
+
+def validate_patch_pixels_for_wsi(
+    width: int,
+    height: int,
+    bbox_2d: Sequence[int],
+    observation_id: str,
+    target_mag: MAG_LITERAL,
+    factor: int = QWEN_SIZE_MULTIPLE,
+) -> None:
+    """Validate model-side patch size constraints."""
     min_pixels = IMAGE_MIN_TOKEN_NUM * factor * factor
     max_pixels = IMAGE_MAX_TOKEN_NUM * factor * factor
     pixels = width * height
-    rel_x1, rel_y1, rel_x2, rel_y2 = bbox_2d
 
     if min(width, height) <= 0:
-        raise ValueError(
-            f"Invalid patch size {width}x{height} for bbox_2d={bbox_2d}",
-        )
+        raise ValueError(f"Invalid patch size {width}x{height} for bbox_2d={bbox_2d}")
 
     if max(width, height) / min(width, height) > MAX_RATIO:
         raise ValueError(
             "WSI_PATCH_INVALID_ASPECT_RATIO: "
-            f"bbox_2d={list(bbox_2d)}; size={width}x{height}; "
-            f"max_ratio={MAX_RATIO}. Action: adjust bbox to reduce the aspect ratio.",
+            f"bbox_2d={list(bbox_2d)}; size={width}x{height}; max_ratio={MAX_RATIO}. "
+            "Action: adjust bbox to reduce the aspect ratio."
         )
 
     if pixels > max_pixels:
         raise ValueError(
             "WSI_PATCH_TOO_LARGE: "
-            f"observation_index={observation_index}; "
-            f"source_mpp={source_mpp:.6f}; target_mpp={target_mpp:.6f}; "
-            f"bbox_2d=[{rel_x1},{rel_y1},{rel_x2},{rel_y2}]; "
-            f"patch_wh={width}x{height}; patch_pixels={pixels}; "
+            f"observation_id={observation_id}; "
+            f"target_mag={target_mag}; "
+            f"bbox_2d={list(bbox_2d)}; "
+            f"patch_wh={width}x{height}; "
+            f"patch_pixels={pixels}; "
             f"max_pixels={max_pixels}. "
-            "Action: shrink bbox (reduce area) and retry.",
+            "Action: shrink bbox and retry."
         )
 
     if pixels < min_pixels:
         raise ValueError(
             "WSI_PATCH_TOO_SMALL: "
-            f"observation_index={observation_index}; "
-            f"source_mpp={source_mpp:.6f}; target_mpp={target_mpp:.6f}; "
-            f"bbox_2d=[{rel_x1},{rel_y1},{rel_x2},{rel_y2}]; "
-            f"patch_wh={width}x{height}; patch_pixels={pixels}; "
+            f"observation_id={observation_id}; "
+            f"target_mag={target_mag}; "
+            f"bbox_2d={list(bbox_2d)}; "
+            f"patch_wh={width}x{height}; "
+            f"patch_pixels={pixels}; "
             f"min_pixels={min_pixels}. "
-            "Action: expand bbox (increase area) and retry.",
+            "Action: expand bbox and retry."
         )
+    
+def next_child_mag(parent_mag_idx: int) -> Optional[str]:
+    """
+    Return the next allowed child magnification.
+
+    The zoom tree is fixed:
+    0.5x -> 2x -> 5x -> 10x -> 20x -> 40x
+    """
+    if parent_mag_idx < 0 or parent_mag_idx >= len(MAG_ORDER):
+        raise ValueError(f"Unknown parent magnification index: {parent_mag_idx}, valid range is [0, {len(MAG_ORDER)-1}]")
+    
+    idx = MAG_ORDER[parent_mag_idx]
+    if idx == len(MAG_ORDER) - 1:
+        return None
+    return MAG_ORDER[idx + 1]
+
+def make_child_observation_id(
+    parent_observation_id: str,
+    target_mag: str,
+    child_index: int,
+) -> str:
+    """
+    Create a hierarchical path-style observation id.
+
+    Examples:
+        parent=root, target_mag=2x, child_index=1
+            -> 2x_1
+
+        parent=2x_1__5x_1, target_mag=10x, child_index=3
+            -> 2x_1__5x_1__10x_3
+    """
+    node = f"{target_mag}_{child_index}"
+    if parent_observation_id == ROOT_OBSERVATION_ID:
+        return node
+    return f"{parent_observation_id}-{node}"
 
 
-def get_roi_at_mpp_optimized(
+def get_roi_at_fixed_mag(
     slide: openslide.OpenSlide,
-    source_roi: Tuple[int, int, int, int],
-    source_mpp: float,
-    source_level0_x: int,
-    source_level0_y: int,
-    target_mpp: float,
-    level0_mpp: float,
-    min_pixels: int = 32,
-) -> Tuple[Image.Image, Tuple[int, int, int, int], float]:
-    """Read a ROI from WSI at an efficient level without upsampling.
+    source_bbox_1000: Tuple[int, int, int, int],
+    source_native_x: int,
+    source_native_y: int,
+    source_native_w: int,
+    source_native_h: int,
+    target_mag: MAG_LITERAL,
+    native_mpp: float,
+    min_pixels: int = QWEN_SIZE_MULTIPLE,
+    patch_multiple: int = QWEN_SIZE_MULTIPLE,
+    max_upsample_factor: float = MAX_UPSAMPLE_FACTOR,
+) -> Tuple[Image.Image, Tuple[int, int, int, int], float, bool, str]:
+    """
+    Extract a child ROI from the parent observation using fixed magnification labels.
 
-    Args:
-        slide: OpenSlide instance.
-        source_roi: ROI in the parent observation pixel coordinates, as
-            ``(x, y, width, height)``.
-        source_mpp: Effective mpp of the parent observation.
-        source_level0_x: Parent observation origin at level-0 x.
-        source_level0_y: Parent observation origin at level-0 y.
-        target_mpp: Requested target mpp for the child crop.
-        level0_mpp: Native level-0 mpp.
-        min_pixels: Minimum output side length.
+    Design:
+    - LLM requests one of the fixed pathology magnifications.
+    - Internally we convert that magnification to canonical mpp.
+    - We always read from native resolution (OpenSlide level 0).
+    - Limited upsampling is allowed for display consistency.
+    - Output size is snapped to a multiple of `patch_multiple`.
 
     Returns:
-        The rendered RGB image, its level-0 ROI, and the effective mpp.
+        crop:
+            Output RGB patch.
+        native_roi:
+            Actual crop region in native coordinates: (x, y, w, h).
+        effective_mpp:
+            Display mpp of the returned patch.
+        is_upsampled:
+            Whether the returned patch is digitally upsampled beyond native resolution.
     """
+    if native_mpp <= 0:
+        raise ValueError(f"native_mpp must be positive, got {native_mpp}")
 
-    if source_mpp <= 0 or target_mpp <= 0 or level0_mpp <= 0:
+    x1_1000, y1_1000, x2_1000, y2_1000 = validate_relative_bbox_1000(source_bbox_1000)
+
+    if source_native_x < 0 or source_native_y < 0 or source_native_w <= 0 or source_native_h <= 0:
         raise ValueError(
-            "source_mpp, target_mpp, and level0_mpp must all be positive.",
+            f"source_native_x {source_native_x}/source_native_y {source_native_y} must be non-negative and "
+            f"source_native_w {source_native_w}/source_native_h {source_native_h} must be positive."
         )
 
-    native_mpp = level0_mpp
-    width, height = slide.dimensions
+    slide_w, slide_h = slide.dimensions
+    parent_x2 = source_native_x + source_native_w
+    parent_y2 = source_native_y + source_native_h
 
-    src_x, src_y, src_w, src_h = source_roi
-    if src_x < 0 or src_y < 0 or src_w <= 0 or src_h <= 0:
+    if parent_x2 > slide_w or parent_y2 > slide_h:
         raise ValueError(
-            f"Invalid source_roi={source_roi}; all dimensions must be positive.",
-        )
-    if source_level0_x < 0 or source_level0_y < 0:
-        raise ValueError(
-            "source_level0_x and source_level0_y must be non-negative.",
+            f"Parent native extent exceeds slide bounds: "
+            f"parent=(x1={source_native_x}, y1={source_native_y}, x2={parent_x2}, y2={parent_y2}), "
+            f"slide_size={slide.dimensions}"
         )
 
-    scale_factor_to_level0 = source_mpp / native_mpp
-    level0_x = math.floor(src_x * scale_factor_to_level0) + source_level0_x
-    level0_y = math.floor(src_y * scale_factor_to_level0) + source_level0_y
-    level0_w = max(1, math.floor(src_w * scale_factor_to_level0))
-    level0_h = max(1, math.floor(src_h * scale_factor_to_level0))
-    output_level0_roi = (level0_x, level0_y, level0_w, level0_h)
+    # 1) Map the relative bbox back to native WSI coordinates.
+    native_x1 = source_native_x + math.floor(source_native_w * x1_1000 / 1000.0)
+    native_y1 = source_native_y + math.floor(source_native_h * y1_1000 / 1000.0)
+    native_x2 = source_native_x + math.ceil(source_native_w * x2_1000 / 1000.0)
+    native_y2 = source_native_y + math.ceil(source_native_h * y2_1000 / 1000.0)
 
-    if level0_x + level0_w > width or level0_y + level0_h > height:
-        raise ValueError(
-            "Requested level-0 ROI exceeds slide bounds: "
-            f"roi={output_level0_roi}, slide_size={slide.dimensions}",
+    native_x1 = max(source_native_x, native_x1)
+    native_y1 = max(source_native_y, native_y1)
+    native_x2 = min(parent_x2, native_x2)
+    native_y2 = min(parent_y2, native_y2)
+
+    base_native_w = max(1, native_x2 - native_x1)
+    base_native_h = max(1, native_y2 - native_y1)
+
+    # 2) Convert fixed magnification to canonical target mpp.
+    canonical_target_mpp = MAG_TO_MPP[target_mag]
+
+    # 3) Allow limited digital upsampling.
+    # Example:
+    #   native_mpp=0.50, target=0.25 -> 2x upsample, allowed
+    #   native_mpp=1.00, target=0.25 -> 4x upsample, clamp to 0.50
+    effective_mpp = max(canonical_target_mpp, native_mpp / max_upsample_factor)
+    is_upsampled = effective_mpp < native_mpp
+
+    # 4) Compute the desired output size at the requested display scale.
+    raw_out_w = max(min_pixels, round(base_native_w * native_mpp / effective_mpp))
+    raw_out_h = max(min_pixels, round(base_native_h * native_mpp / effective_mpp))
+
+    out_w = snap_to_multiple(raw_out_w, patch_multiple, mode="expand")
+    out_h = snap_to_multiple(raw_out_h, patch_multiple, mode="expand")
+
+    # 5) Slightly adjust the native ROI so the final output naturally matches
+    #    the snapped size. This reduces extra distortion from later resizing.
+    desired_native_w = max(1, round(out_w * effective_mpp / native_mpp))
+    desired_native_h = max(1, round(out_h * effective_mpp / native_mpp))
+
+    center_x = native_x1 + base_native_w / 2.0
+    center_y = native_y1 + base_native_h / 2.0
+
+    # If the requested native ROI is too large for the slide, shrink the output
+    # size first, then re-compute the native crop size. No padding is used.
+    if desired_native_w > slide_w:
+        max_out_w = snap_down_to_multiple(
+            max(min_pixels, math.floor(slide_w * native_mpp / effective_mpp)),
+            patch_multiple,
         )
+        out_w = max(min_pixels, max_out_w)
+        desired_native_w = max(1, round(out_w * effective_mpp / native_mpp))
 
-    if target_mpp < native_mpp:
-        effective_mpp = native_mpp
-        optimal_level = 0
-        optimal_level_w = max(min_pixels, level0_w)
-        optimal_level_h = max(min_pixels, level0_h)
-        target_w = max(min_pixels, level0_w)
-        target_h = max(min_pixels, level0_h)
-    else:
-        effective_mpp = target_mpp
-        level_mpps = [native_mpp * ds for ds in slide.level_downsamples]
-        valid_levels = [idx for idx, mpp in enumerate(level_mpps) if mpp <= target_mpp]
-        if not valid_levels:
-            optimal_level = 0
-        else:
-            optimal_level = valid_levels[-1]
+    if desired_native_h > slide_h:
+        max_out_h = snap_down_to_multiple(
+            max(min_pixels, math.floor(slide_h * native_mpp / effective_mpp)),
+            patch_multiple,
+        )
+        out_h = max(min_pixels, max_out_h)
+        desired_native_h = max(1, round(out_h * effective_mpp / native_mpp))
 
-        optimal_level_downsample = slide.level_downsamples[optimal_level]
-        optimal_level_w = max(min_pixels, math.floor(level0_w / optimal_level_downsample))
-        optimal_level_h = max(min_pixels, math.floor(level0_h / optimal_level_downsample))
+    aligned_native_x = place_interval_without_resizing(center_x, desired_native_w, slide_w)
+    aligned_native_y = place_interval_without_resizing(center_y, desired_native_h, slide_h)
 
-        scale_factor_to_target = native_mpp / target_mpp
-        target_w = max(min_pixels, math.floor(level0_w * scale_factor_to_target))
-        target_h = max(min_pixels, math.floor(level0_h * scale_factor_to_target))
+    native_roi = (
+        aligned_native_x,
+        aligned_native_y,
+        desired_native_w,
+        desired_native_h,
+    )
 
-    intermediate_image = slide.read_region(
-        (level0_x, level0_y),
-        optimal_level,
-        (optimal_level_w, optimal_level_h),
+    # 6) Read from native resolution only.
+    crop = slide.read_region(
+        (aligned_native_x, aligned_native_y),
+        0,
+        (desired_native_w, desired_native_h),
     ).convert("RGB")
 
-    if intermediate_image.size != (target_w, target_h):
-        target_image = intermediate_image.resize((target_w, target_h), Image.Resampling.LANCZOS)
-    else:
-        target_image = intermediate_image
+    # 7) 根据放大还是缩小，动态选择最优的重采样算法
+    if crop.size != (out_w, out_h):
+        if is_upsampled:
+            # 上采样：使用 BICUBIC，避免在细胞核等高反差边缘产生 Lanczos 振铃效应干扰模型
+            crop = crop.resize((out_w, out_h), Image.Resampling.BICUBIC)
+        else:
+            # 下采样：使用 LANCZOS，提供最强的抗锯齿（Anti-aliasing）效果
+            crop = crop.resize((out_w, out_h), Image.Resampling.LANCZOS)
 
-    return target_image, output_level0_roi, effective_mpp
+    # 判断是否发生了“微观妥协”（模型要 40x，但实际给不到）
+    delivery_status = "success"
+    if effective_mpp > canonical_target_mpp * 1.1: # 给 10% 的容差
+        # 计算实际交付的相当于传统病理的多少倍 (10.0 / effective_mpp 近似等于倍率)
+        realized_mag_val = 10.0 / effective_mpp 
+        delivery_status = f"capped_at_{realized_mag_val:.1f}x"
+
+    return crop, native_roi, effective_mpp, is_upsampled, delivery_status
+
+ 
 
 
 class WSIReActAgent(ReActAgentBase):
-    """A reusable WSI agent with a real zoom-in tool."""
+    """WSI zooming agent with fixed pathology magnifications and path-style observation ids."""
 
     finish_function_name: str = "generate_response"
 
@@ -304,7 +566,7 @@ class WSIReActAgent(ReActAgentBase):
         toolkit: Optional[Toolkit] = None,
         memory: Optional[MemoryBase] = None,
         work_dir: Optional[str] = None,
-        max_iters: int = 20,
+        max_iters: int = 50,
         parallel_tool_calls: bool = False,
         min_pixels: int = 32,
     ) -> None:
@@ -316,29 +578,44 @@ class WSIReActAgent(ReActAgentBase):
         self._sys_prompt = sys_prompt
         self.max_iters = max_iters
         self.parallel_tool_calls = parallel_tool_calls
-        self.min_pixels = max(1, min_pixels)
+        self.min_pixels = min_pixels
 
-        self._stream_prefix: Dict[str, Dict[str, str]] = {}
+        self._stream_prefix: dict = {}
         self.memory = memory or InMemoryMemory()
         self.toolkit = toolkit or Toolkit()
         self._required_structured_model: Type[BaseModel] | None = None
 
-        self.workspace_root = Path(
-            work_dir
-            or "/data/home/zhangchen/project/RL/SlideReasoner/slidereasoner/workspace/wsi_agent",
-        )
-        self.workspace_root.mkdir(parents=True, exist_ok=True)
+        self.workspace_root = work_dir
 
         self.slide: Optional[openslide.OpenSlide] = None
-        self.slide_path: Optional[str] = None
-        self.slide_label: Optional[str] = None
-        self.level0_mpp: Optional[float] = None
+        self.current_slide_path: Optional[str] = None
+        self.current_slide_label: Optional[str] = None
+        self.native_mpp: Optional[float] = None
         self.session_dir: Optional[Path] = None
-        self.action_idx: int = 1
+
+
+        self.action_idx: int = 0
+
+        # Keep image paths in creation order if you still need this outside.
         self.observation_list: List[str] = []
-        self.observation_meta: List[ObservationMeta] = []
+
+        # Stable creation order for trace export / debugging
+        self.observation_order: List[str] = []
+
+        # observation_id -> image path
+        self.observation_dict: Dict[str, str] = {}
+
+         # Main observation store:
+        # observation_id -> metadata
+        self.observation_meta: Dict[str, ObservationMeta] = {}
+
+
+        self.current_observation_id: Optional[str] = None
 
         self.toolkit.register_tool_function(self.zoom_in_image)
+        self.toolkit.register_tool_function(self.backtrack_to_observation)
+        self.toolkit.register_tool_function(self.mark_roi)
+
 
         self.register_state("name")
         self.register_state("_sys_prompt")
@@ -352,22 +629,103 @@ class WSIReActAgent(ReActAgentBase):
 
         self.memory = InMemoryMemory()
         self._stream_prefix.clear()
-        self.action_idx = 1
-        self.observation_list = []
-        self.observation_meta = []
+        self.action_idx = 0
+
         if self.slide is not None:
             self.slide.close()
         self.slide = None
-        self.slide_path = None
-        self.slide_label = None
-        self.level0_mpp = None
+        self.current_slide_path: Optional[str] = None
+        self.current_slide_label: Optional[str] = None
+    
+        self.observation_list: List[str] = []
+        self.observation_order: List[str] = []
+        self.observation_dict: Dict[str, str] = {}
+        self.observation_meta: Dict[str, ObservationMeta] = {}
+        self.current_observation_id: Optional[str] = None
+
+        self.workspace_root = None
+        self.native_mpp = None
         self.session_dir = None
+
+    def require_observation(self, observation_id: str) -> ObservationMeta:
+        """Return an observation metadata object or raise a clear error."""
+        if observation_id not in self.observation_meta:
+            raise ValueError(
+                f"Invalid observation_id={observation_id}. "
+                f"Available ids: {self.observation_order}"
+            )
+        return self.observation_meta[observation_id]
+    
+
+    def render_overview_thumbnail(
+        self,
+        slide: openslide.OpenSlide,
+        native_mpp: float,
+        target_mag: MAG_LITERAL = "0.5x",
+    ) -> Tuple[Image.Image, float, str]:
+        """
+        Render the initial whole-slide overview at nominal 0.5x.
+
+        We use thumbnail rendering here for efficiency.
+        Patch zooming still uses native-resolution cropping.
+        """
+        slide_w, slide_h = slide.dimensions
+        target_mpp = MAG_TO_MPP[target_mag]
+
+        raw_w = max(QWEN_SIZE_MULTIPLE, round(slide_w * native_mpp / target_mpp))
+        raw_h = max(QWEN_SIZE_MULTIPLE, round(slide_h * native_mpp / target_mpp))
+
+        out_w, out_h, scale = fit_pixels_to_budget(
+            raw_w,
+            raw_h,
+            multiple=QWEN_SIZE_MULTIPLE,
+            min_token_num=IMAGE_MIN_TOKEN_NUM,
+            max_token_num=IMAGE_MAX_TOKEN_NUM,
+        )
+
+
+        # 核心修复点：计算真实的 effective_mpp
+        # 因为 out_w 可能被 snap_to_multiple 进行了微调，所以最精确的做法是直接用物理宽度除以像素宽度
+        # slide_w * native_mpp = 切片的绝对物理宽度 (微米)
+        effective_mpp_w = (slide_w * native_mpp) / out_w
+        effective_mpp_h = (slide_h * native_mpp) / out_h
+        
+        # 取平均值或宽度的 MPP 作为最终的有效 MPP（由于长宽比几乎保持不变，两者差距极小）
+        effective_mpp = (effective_mpp_w + effective_mpp_h) / 2.0
+
+
+        # 1. 先获取一个稍大于或等于目标的缩略图 (利用 OpenSlide 的金字塔层级加速)
+        thumb = slide.get_thumbnail((out_w, out_h))
+        thumb = to_rgb(thumb)
+
+        # 2. 强制 Resize 到严格对齐 32 倍数的尺寸
+        if thumb.size != (out_w, out_h):
+            # 概览图下采样使用 LANCZOS 保持清晰度
+            thumb = thumb.resize((out_w, out_h), Image.Resampling.LANCZOS)      
+
+        # 判断是否因为 Token 限制发生了严重的“宏观妥协”
+        # 注意逻辑反转：MPP 越大，说明压缩越狠，倍率越低
+        delivery_status = "success"
+        if effective_mpp > target_mpp * 1.1:
+            logger.warning(
+                f"Effective MPP {effective_mpp:.4f} is significantly higher than target {target_mpp:.4f}. "
+                f"The overview image may be too blurry for detailed inspection. "
+                f"Consider increasing the model pixel budget or allowing larger overview sizes."
+            )
+
+            # 计算实际被压缩到了相当于多少倍率
+            realized_mag_val = 10.0 / effective_mpp 
+            delivery_status = f"compressed_to_{realized_mag_val:.1f}x"
+
+
+        return thumb, effective_mpp, delivery_status
+    
 
     def start_wsi_session(
         self,
         wsi_path: str,
         question: str,
-        level0_mpp: Optional[float] = None,
+        native_mpp: Optional[float] = None,
         thumbnail_size: Tuple[int, int] = (1024, 1024),
         slide_label: Optional[str] = None,
     ) -> Msg:
@@ -378,46 +736,58 @@ class WSIReActAgent(ReActAgentBase):
         if not os.path.exists(wsi_path):
             raise FileNotFoundError(f"WSI file not found: {wsi_path}")
 
-        self.slide_path = os.path.abspath(wsi_path)
-        self.slide_label = slide_label or Path(wsi_path).stem
-        self.slide = openslide.OpenSlide(self.slide_path)
-        self.level0_mpp = _infer_level0_mpp(self.slide, level0_mpp)
+        self.current_slide_path = os.path.abspath(wsi_path)
+        self.current_slide_label = slide_label or Path(wsi_path).stem
+        self.slide = openslide.OpenSlide(self.current_slide_path)
+        self.native_mpp = infer_native_mpp(self.slide, native_mpp)
 
-        session_name = f"{self.slide_label}_{shortuuid.uuid()}"
-        self.session_dir = self.workspace_root / session_name
-        self.session_dir.mkdir(parents=True, exist_ok=True)
+        overview_image, overview_mpp, delivery_status = self.render_overview_thumbnail(self.slide, self.native_mpp, MAG_ORDER[0])
 
-        thumbnail = to_rgb(self.slide.get_thumbnail(thumbnail_size))
-        thumbnail_path = str(self.session_dir / f"observation_0_{shortuuid.uuid()}.png")
-        thumbnail.save(thumbnail_path)
+        time_str = datetime.now(ZoneInfo("Asia/Shanghai")).strftime("%Y%m%d%H%M%S")
+        self.session_dir = os.path.join(self.workspace_root, self.current_slide_label, time_str, shortuuid.uuid())
+        os.makedirs(self.session_dir, exist_ok=True)
+
+        if delivery_status.startswith("capped_at_"):
+            actual_mag = delivery_status.split("_")[-1].replace(".", "p")
+        else:
+            actual_mag = MAG_ORDER[0].replace(".", "p")
+
+        self.ROOT_OBSERVATION_ID = f"obs_{actual_mag}_root"
+
+        thumbnail_path = os.path.join(self.session_dir, f"{self.ROOT_OBSERVATION_ID}.png")
+
+        overview_image.save(thumbnail_path)
+
 
         level0_w, level0_h = self.slide.dimensions
-        thumb_w, thumb_h = thumbnail.size
-        scale_x = level0_w / max(1, thumb_w)
-        scale_y = level0_h / max(1, thumb_h)
-        effective_mpp = self.level0_mpp * max(scale_x, scale_y)
+        thumb_w, thumb_h = overview_image.size
 
         meta = ObservationMeta(
-            observation_index=0,
+            observation_id=self.ROOT_OBSERVATION_ID,
             image_path=thumbnail_path,
-            label="whole slide thumbnail",
-            level0_x=0,
-            level0_y=0,
-            level0_w=level0_w,
-            level0_h=level0_h,
-            effective_mpp=effective_mpp,
-            parent_observation_index=None,
+            label="whole-slide thumbnail",
+            native_x=0,
+            native_y=0,
+            native_w=level0_w,
+            native_h=level0_h,
+            image_w=thumb_w,
+            image_h=thumb_h,
+            effective_mpp=overview_mpp,
+            parent_observation_id=None,
+            display_mag=actual_mag,
+            local_child_index=0,
+            is_upsampled=False,
+            reason="initial whole-slide overview",
         )
         self.observation_list.append(thumbnail_path)
         self.observation_meta.append(meta)
-
         return Msg(
             name="user",
             content=[
                 TextBlock(
                     type="text",
                     text=(
-                        f"The following image is observation_index 0 for WSI "
+                        f"The following image is observation_id {self.ROOT_OBSERVATION_ID} for WSI "
                         f"'{self.slide_label}'.\n"
                         f"- slide_path: {self.slide_path}\n"
                         f"- level0_dimensions: {level0_w}x{level0_h}\n"
