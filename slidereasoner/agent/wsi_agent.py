@@ -10,7 +10,7 @@ reasoning session:
 4. Save each zoom result as a new observation and feed it back to the model.
 
 Design choice used here:
-- The LLM only sees pathology-style magnification labels: 1x / 5x / 10x / 20x / 40x
+- The LLM only sees pathology-style magnification labels: 0.5x / 2x / 5x / 10x / 20x / 40x
 - Internally, crops are generated with canonical target mpp:
     0.5x -> 20.0
     2x -> 5.0
@@ -22,11 +22,6 @@ Design choice used here:
   controlled upsampling is allowed, but capped by `max_upsample_ratio`.
 """
 
-
-# test
-
-
-#@ sfas fasdff
 from __future__ import annotations
 
 import asyncio
@@ -72,6 +67,7 @@ from slidereasoner.utils.print_utils import print_multimodal_trace
 # 这里直接固定到你想要的 6 档。
 # LLM 层只操作这些倍率，底层统一用 canonical mpp 实现。
 MAG_LITERAL = Literal["0.5x", "2x", "5x", "10x", "20x", "40x"]
+ZOOM_MAG_LITERAL = Literal["2x", "5x", "10x", "20x", "40x"]
 
 MAG_TO_MPP: Dict[str, float] = {
     "0.5x": 20.0,
@@ -149,6 +145,7 @@ class ObservationMeta:
 
     # Pathology-facing magnification label shown to the model.
     display_mag: str
+    mag_idx: int
 
     parent_observation_id: Optional[str]
 
@@ -186,6 +183,10 @@ class MarkROIArgs(BaseModel):
     observation_id: str = Field(..., description="Observation to mark.")
     reason: str = Field(..., description="Why this observation is important.")
 
+def sanitize_observation_id_for_filename(observation_id: str) -> str:
+    """Make an observation id safe and tidy for filenames."""
+    return observation_id.replace(".", "p")
+
 def infer_native_mpp(
     slide: openslide.OpenSlide,
     override_native_mpp: Optional[float] = None,
@@ -222,7 +223,6 @@ def infer_native_mpp(
         "Please provide `override_native_mpp` explicitly when starting the session.",
     )
 
-
 def validate_relative_bbox_1000(bbox_2d: Sequence[int]) -> Tuple[int, int, int, int]:
     """Validate a [x1, y1, x2, y2] bbox on a 0-1000 scale."""
     if len(bbox_2d) != 4:
@@ -237,8 +237,6 @@ def validate_relative_bbox_1000(bbox_2d: Sequence[int]) -> Tuple[int, int, int, 
         raise ValueError(f"bbox_2d must satisfy x2>x1 and y2>y1, got {bbox_2d}")
 
     return x1, y1, x2, y2
-
-
 
 def snap_to_multiple(value: int, multiple: int, mode: Literal["expand", "nearest"] = "expand") -> int:
     """
@@ -307,7 +305,6 @@ def fit_pixels_to_budget(
     out_h = snap_to_multiple(max(1, round(height * scale)), multiple, mode="nearest")
     return out_w, out_h, scale
 
-
 def place_interval_without_resizing(center: float, size: int, limit: int) -> int:
     """
     Place a fixed-size interval inside [0, limit) by shifting only.
@@ -338,7 +335,7 @@ def validate_patch_pixels_for_wsi(
     pixels = width * height
 
     if min(width, height) <= 0:
-        raise ValueError(f"Invalid patch size {width}x{height} for bbox_2d={bbox_2d}")
+        raise ValueError(f"Invalid patch size {width}x{height} for bbox_2d={bbox_2d}.")
 
     if max(width, height) / min(width, height) > MAX_RATIO:
         raise ValueError(
@@ -371,22 +368,33 @@ def validate_patch_pixels_for_wsi(
             "Action: expand bbox and retry."
         )
     
-def next_child_mag(parent_mag_idx: int) -> Optional[str]:
+def next_child_mag(parent_mag_idx: int) -> str:
     """
     Return the next allowed child magnification.
 
     The zoom tree is fixed:
+    0 -> 1 -> 2 -> 3 -> 4 -> 5
     0.5x -> 2x -> 5x -> 10x -> 20x -> 40x
-    """
-    if parent_mag_idx < 0 or parent_mag_idx >= len(MAG_ORDER):
-        raise ValueError(f"Unknown parent magnification index: {parent_mag_idx}, valid range is [0, {len(MAG_ORDER)-1}]")
     
-    idx = MAG_ORDER[parent_mag_idx]
-    if idx == len(MAG_ORDER) - 1:
-        return None
-    return MAG_ORDER[idx + 1]
+    Returns:
+        str: The next magnification string (e.g., "5x"), 
+             or an explicit error string if out of bounds.
+    """
+    # 1. 检查 parent_mag_idx 本身是否存在（是否合法）
+    if parent_mag_idx < 0 or parent_mag_idx >= len(MAG_ORDER):
+        raise ValueError(f"ERROR_INVALID_PARENT_INDEX: {parent_mag_idx} is out of valid range [0, {len(MAG_ORDER)-1}].")
+    
+    # 2. 计算 child 的 index 并检查其是否存在（即父节点是否已经到了最大倍率）
+    child_idx = parent_mag_idx + 1
+    if child_idx >= len(MAG_ORDER):
+        parent_mag_str = MAG_ORDER[parent_mag_idx]
+        raise ValueError(f"ERROR_MAX_MAGNIFICATION_REACHED: The current observation is already at the maximum magnification ({parent_mag_str}). Cannot zoom in further.")
+        
+    # 3. 正常返回下一级倍率字符串
+    return MAG_ORDER[child_idx]
 
 def make_child_observation_id(
+    ROOT_OBSERVATION_ID: str,
     parent_observation_id: str,
     target_mag: str,
     child_index: int,
@@ -396,10 +404,10 @@ def make_child_observation_id(
 
     Examples:
         parent=root, target_mag=2x, child_index=1
-            -> 2x_1
+            -> root-2x_1
 
-        parent=2x_1__5x_1, target_mag=10x, child_index=3
-            -> 2x_1__5x_1__10x_3
+        parent=root-2x_1-5x_1, target_mag=10x, child_index=3
+            -> root-2x_1-5x_1-10x_3
     """
     node = f"{target_mag}_{child_index}"
     if parent_observation_id == ROOT_OBSERVATION_ID:
@@ -601,10 +609,9 @@ class WSIReActAgent(ReActAgentBase):
 
         self.action_idx: int = 0
 
-        # Keep image paths in creation order if you still need this outside.
-        self.observation_list: List[str] = []
 
-        # Stable creation order for trace export / debugging
+        # Stable creation order for trace export / debugging 
+        # observation_id is generated based on this order + parent-child relationship, not just a global counter.
         self.observation_order: List[str] = []
 
         # observation_id -> image path
@@ -642,7 +649,6 @@ class WSIReActAgent(ReActAgentBase):
         self.current_slide_path: Optional[str] = None
         self.current_slide_label: Optional[str] = None
     
-        self.observation_list: List[str] = []
         self.observation_order: List[str] = []
         self.observation_dict: Dict[str, str] = {}
         self.observation_meta: Dict[str, ObservationMeta] = {}
@@ -752,7 +758,7 @@ class WSIReActAgent(ReActAgentBase):
         self.session_dir = os.path.join(self.workspace_root, self.current_slide_label, time_str, shortuuid.uuid())
         os.makedirs(self.session_dir, exist_ok=True)
 
-        if delivery_status.startswith("capped_at_"):
+        if delivery_status != "success":
             actual_mag = delivery_status.split("_")[-1].replace(".", "p")
         else:
             actual_mag = MAG_ORDER[0].replace(".", "p")
@@ -767,7 +773,7 @@ class WSIReActAgent(ReActAgentBase):
         level0_w, level0_h = self.slide.dimensions
         thumb_w, thumb_h = overview_image.size
 
-        meta = ObservationMeta(
+        root_meta = ObservationMeta(
             observation_id=self.ROOT_OBSERVATION_ID,
             image_path=thumbnail_path,
             label="whole-slide thumbnail",
@@ -780,12 +786,20 @@ class WSIReActAgent(ReActAgentBase):
             effective_mpp=overview_mpp,
             parent_observation_id=None,
             display_mag=actual_mag,
+            mag_idx=0,
             local_child_index=0,
             is_upsampled=False,
             reason="initial whole-slide overview",
         )
-        self.observation_list.append(thumbnail_path)
-        self.observation_meta.append(meta)
+        self.current_observation_id = self.ROOT_OBSERVATION_ID
+
+
+        self.observation_order.append(self.ROOT_OBSERVATION_ID)
+    
+        self.observation_dict[self.ROOT_OBSERVATION_ID] = thumbnail_path
+
+        self.observation_meta[self.ROOT_OBSERVATION_ID] = root_meta
+
         return Msg(
             name="user",
             content=[
@@ -793,12 +807,8 @@ class WSIReActAgent(ReActAgentBase):
                     type="text",
                     text=(
                         f"The following image is observation_id {self.ROOT_OBSERVATION_ID} for WSI "
-                        f"'{self.slide_label}'.\n"
-                        f"- slide_path: {self.slide_path}\n"
-                        f"- level0_dimensions: {level0_w}x{level0_h}\n"
-                        f"- level0_mpp: {self.level0_mpp:.6f}\n"
-                        f"- observation_mpp: {effective_mpp:.6f}\n"
-                        f"- Use zoom_in_image with observation_index values to inspect ROIs."
+                        f"- display_mag: {actual_mag}\n"
+                        f"- Use zoom_in_image with observation_id values to inspect ROIs."
                     ),
                 ),
                 ImageBlock(
@@ -809,6 +819,170 @@ class WSIReActAgent(ReActAgentBase):
             ],
             role="user",
         )
+
+
+
+    def zoom_in_image(
+        self,
+        observation_id: str,
+        bbox_2d: Annotated[List[int], Field(min_length=4, max_length=4)],
+        target_mag: ZOOM_MAG_LITERAL,
+        label: str,
+        reason: str = "",
+    ) -> ToolResponse:
+        """
+        Create a child observation by zooming into a bbox on a parent observation.
+
+        Args:
+            observation_id (str):
+                The parent observation ID.
+            bbox_2d (list[int]):
+                The bounding box in the parent observation coordinate system, formatted as [x1, y1, x2, y2],
+                where (x1, y1) is the top-left corner (x1 is left and y1 is top) and (x2, y2) is the bottom-right corner (x2 is right and y2 is bottom). 
+                The bounding box uses the relative coordinated with range 0-1000.
+            target_mag (Literal["2x", "5x", "10x", "20x", "40x"]):
+                The target magnification level to read.
+            label (str):
+                The object label for the selected region.
+            reason (str):
+                Optional reason for why this zoom is needed.
+        """
+        # 这里的 observation_id 是父观察的 ID，bbox_2d 是相对于父观察的坐标，target_mag 是目标倍率。
+        # 实际实现时需要根据 observation_id 找到对应的 WSI 位置和当前倍率，然后计算出新的坐标和读取对应倍率的图像。
+        # 最后返回新的 observation_id 和图像数据。
+
+        try:
+            if self.slide is None or self.level0_mpp is None or self.session_dir is None:
+                raise RuntimeError("No active WSI session. Call start_wsi_session first.")
+            
+            x1, y1, x2, y2 = validate_relative_bbox_1000(bbox_2d)
+            parent = self.require_observation(observation_id)
+
+            # 1. Validate target_mag and get corresponding mpp
+            expected_child_mag = self.next_child_mag(parent.mag_idx)
+
+            
+            # 2. Validate that the requested target_mag is the expected next level based on the parent's mag_idx
+            if target_mag != expected_child_mag:
+                raise ValueError(
+                    f"Invalid target_mag={target_mag} for parent {observation_id} "
+                    f"at {parent.display_mag}. Expected next level: {expected_child_mag}"
+                )
+            
+            # 3. Get the child ROI at the requested fixed magnification, allowing limited upsampling if necessary
+            crop, native_roi, effective_mpp, is_upsampled, delivery_status= get_roi_at_fixed_mag(
+                slide=self.slide,
+                source_bbox_1000=(x1, y1, x2, y2),
+                source_native_x=parent.native_x,
+                source_native_y=parent.native_y,
+                source_native_w=parent.native_w,
+                source_native_h=parent.native_h,
+                target_mag=target_mag,
+                native_mpp=self.native_mpp,
+                min_pixels=QWEN_SIZE_MULTIPLE,
+                patch_multiple=QWEN_SIZE_MULTIPLE,
+                max_upsample_factor=MAX_UPSAMPLE_FACTOR,
+            )
+
+            validate_patch_pixels_for_wsi(
+                width=crop.size[0],
+                height=crop.size[1],
+                bbox_2d=bbox_2d,
+                observation_id=observation_id,
+                target_mag=target_mag,
+                factor=QWEN_SIZE_MULTIPLE,
+            )
+
+            if delivery_status != "success":
+                actual_mag = delivery_status.split("_")[-1].replace(".", "p")
+            else:
+                actual_mag = MAG_ORDER[0].replace(".", "p")
+            
+            # 4. Generate a new observation ID for the child, encoding the parent-child relationship and the target magnification
+            local_child_index = len(parent.children_ids) + 1
+            child_observation_id = make_child_observation_id(
+                parent_observation_id=observation_id,
+                target_mag=target_mag,
+                child_index=local_child_index,
+            )
+
+            safe_id = sanitize_observation_id_for_filename(child_observation_id)
+            image_path = os.path.join(self.session_dir, f"{safe_id}.png")
+            crop.save(image_path)
+
+            child_meta = ObservationMeta(
+                observation_id=child_observation_id,
+                image_path=image_path,
+                label=label or f"Zoomed in from {parent.display_mag} to {target_mag} of {parent.observation_id}",
+                native_x=native_roi[0],
+                native_y=native_roi[1],
+                native_w=native_roi[2],
+                native_h=native_roi[3],
+                image_w=crop.size[0],
+                image_h=crop.size[1],
+                effective_mpp=effective_mpp,
+                parent_observation_id=observation_id,
+                display_mag=actual_mag,
+                mag_idx=parent.mag_idx + 1,
+                local_child_index=local_child_index,
+                is_upsampled=is_upsampled,
+                reason=reason,
+            )
+
+            self.observation_order.append(child_observation_id)
+            self.observation_dict[child_observation_id] = image_path
+            self.observation_meta[child_observation_id] = child_meta
+            parent.children_ids.append(child_observation_id)
+            self.current_observation_id = child_observation_id
+
+            return ToolResponse(
+                content=[
+                    TextBlock(
+                        type="text",
+                        text=(
+                            "zoom_in_image succeeded. "
+                            f"Created observation {child_observation_id} from {observation_id}.\n"
+                            f"display_mag={target_mag}, "
+                            f"label={label}, "
+                            f"reason={reason}, "
+                            f"Use observation_id={child_observation_id} for later follow-up tool calls."
+                        ),
+                    ),
+                    ImageBlock(
+                        type="image",
+                        source=URLSource(type="url", url=image_path),
+                    ),
+                ],
+                metadata={
+                    "success": True,
+                    "observation_id": child_observation_id,
+                    "parent_observation_id": observation_id,
+                    "effective_mpp": effective_mpp,
+                },
+            )
+
+        except ValidationError as e:
+            return ToolResponse(
+                content=[
+                    TextBlock(
+                        type="text",
+                        text=f"Validation error: {str(e)}",
+                    ),
+                ],
+                metadata={"success": False},
+            )
+        
+        except Exception as e:
+            return ToolResponse(
+                content=[
+                    TextBlock(
+                        type="text",
+                        text=f"Error during zoom_in_image: {str(e)}",
+                    ),
+                ],
+                metadata={"success": False},
+                )
+
 
     async def run_on_wsi(
         self,
@@ -1085,139 +1259,3 @@ class WSIReActAgent(ReActAgentBase):
             },
             is_last=True,
         )
-
-    def zoom_in_image(
-        self,
-        bbox_2d: Annotated[List[float], Field(min_length=4, max_length=4)],
-        target_mpp: Annotated[float, Field(gt=0)],
-        label: str,
-        observation_index: Annotated[int, Field(ge=0)],
-    ) -> ToolResponse:
-        """Zoom in on a WSI observation using true level-aware WSI reads."""
-
-        try:
-            if self.slide is None or self.level0_mpp is None or self.session_dir is None:
-                raise RuntimeError("No active WSI session. Call start_wsi_session first.")
-
-            if observation_index >= len(self.observation_meta):
-                raise IndexError(
-                    f"observation_index={observation_index} is out of range. "
-                    f"Available indices: 0..{len(self.observation_meta) - 1}",
-                )
-
-            rel_x1, rel_y1, rel_x2, rel_y2 = _validate_relative_bbox(bbox_2d)
-            parent_meta = self.observation_meta[observation_index]
-
-            if not os.path.exists(parent_meta.image_path):
-                raise FileNotFoundError(
-                    f"Observation image does not exist: {parent_meta.image_path}",
-                )
-
-            parent_image = to_rgb(Image.open(parent_meta.image_path))
-            img_width, img_height = parent_image.size
-
-            abs_x1 = math.floor(rel_x1 / 1000.0 * img_width)
-            abs_y1 = math.floor(rel_y1 / 1000.0 * img_height)
-            abs_x2 = math.ceil(rel_x2 / 1000.0 * img_width)
-            abs_y2 = math.ceil(rel_y2 / 1000.0 * img_height)
-
-            left, top, right, bottom = maybe_resize_bbox(
-                abs_x1,
-                abs_y1,
-                abs_x2,
-                abs_y2,
-                img_width,
-                img_height,
-            )
-
-            roi_image, level0_roi, effective_mpp = get_roi_at_mpp_optimized(
-                slide=self.slide,
-                source_roi=(left, top, right - left, bottom - top),
-                source_mpp=parent_meta.effective_mpp,
-                source_level0_x=parent_meta.level0_x,
-                source_level0_y=parent_meta.level0_y,
-                target_mpp=target_mpp,
-                level0_mpp=self.level0_mpp,
-                min_pixels=self.min_pixels,
-            )
-
-            resized_h, resized_w = smart_resize(
-                roi_image.height,
-                roi_image.width,
-                factor=32,
-            )
-            _validate_patch_pixels_for_wsi(
-                bbox_2d=bbox_2d,
-                width=resized_w,
-                height=resized_h,
-                observation_index=observation_index,
-                source_mpp=parent_meta.effective_mpp,
-                target_mpp=target_mpp,
-            )
-
-            if roi_image.size != (resized_w, resized_h):
-                roi_image = roi_image.resize((resized_w, resized_h), Image.Resampling.BICUBIC)
-
-            output_path = str(
-                self.session_dir / f"observation_{self.action_idx}_{shortuuid.uuid()}.png",
-            )
-            roi_image.save(output_path)
-
-            new_observation_index = len(self.observation_meta)
-            level0_x, level0_y, level0_w, level0_h = level0_roi
-            child_meta = ObservationMeta(
-                observation_index=new_observation_index,
-                image_path=output_path,
-                label=label,
-                level0_x=level0_x,
-                level0_y=level0_y,
-                level0_w=level0_w,
-                level0_h=level0_h,
-                effective_mpp=effective_mpp,
-                parent_observation_index=observation_index,
-            )
-
-            self.observation_list.append(output_path)
-            self.observation_meta.append(child_meta)
-            self.action_idx += 1
-
-            return ToolResponse(
-                content=[
-                    TextBlock(
-                        type="text",
-                        text=(
-                            "zoom_in_image succeeded.\n"
-                            "Generated a zoomed-in WSI ROI view.\n"
-                            f"- returned observation_index: {new_observation_index}\n"
-                            f"- source observation_index: {observation_index}\n"
-                            f"- label: {label}\n"
-                            f"- effective_mpp: {effective_mpp:.6f}\n"
-                            f"- level0_roi_xywh: {level0_roi}\n"
-                            f"Use observation_index={new_observation_index} for later follow-up tool calls."
-                        ),
-                    ),
-                    ImageBlock(
-                        type="image",
-                        source=URLSource(type="url", url=output_path),
-                    ),
-                ],
-                metadata={
-                    "success": True,
-                    "observation_index": new_observation_index,
-                    "source_observation_index": observation_index,
-                    "effective_mpp": effective_mpp,
-                    "level0_roi": level0_roi,
-                    "label": label,
-                },
-            )
-
-        except Exception as exc:  # pylint: disable=broad-except
-            return ToolResponse(
-                content=[
-                    TextBlock(
-                        type="text",
-                        text=f"Failure to execute zoom_in_image, error: {exc}",
-                    ),
-                ],
-                metadata={"success": False},
-            )

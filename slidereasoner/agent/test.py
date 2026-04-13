@@ -310,7 +310,7 @@ def _validate_patch_pixels_for_wsi(
 
 def _sanitize_observation_id_for_filename(observation_id: str) -> str:
     """Make an observation id safe and tidy for filenames."""
-    return observation_id.replace(".", "p").replace("__", "__")
+    return observation_id.replace(".", "p")
 
 
 def _next_child_mag(parent_mag: str) -> Optional[str]:
